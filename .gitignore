@@ -1,0 +1,10 @@
+# 只提交源码与说明；登录存档、额度记录、本机设置和编译产物都不入库
+*
+!.gitignore
+!README.md
+!src/
+!src/Program.cs
+!src/main.xaml
+!src/dialog.xaml
+!src/theme.xaml
+!src/build.ps1
