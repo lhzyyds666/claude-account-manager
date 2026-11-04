@@ -493,6 +493,198 @@ static class Core
     }
 }
 
+// ---- Skill 同步：调用 ai-config 仓库的 sync_ai_config.py，汇总三端每个 Skill 的状态 ----
+class SkillRow
+{
+    public string Name;
+    public bool Managed;
+    public Dictionary<string, string> State = new Dictionary<string, string>();          // ok/changed/pending/local/excluded/absent
+    public Dictionary<string, List<string>> Changes = new Dictionary<string, List<string>>();
+    public Dictionary<string, string> Errors = new Dictionary<string, string>();
+    public List<string> Adapt = new List<string>();
+}
+
+static class SkillSync
+{
+    static readonly string Home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+    public static readonly string Repo = Path.Combine(Home, ".codex");
+    public static readonly string[] Clients = { "codex", "claude", "pi" };
+    public static readonly Dictionary<string, string> Homes = new Dictionary<string, string> {
+        { "codex", Repo }, { "claude", Path.Combine(Home, ".claude") }, { "pi", Path.Combine(Home, ".pi", "agent") } };
+    static readonly JavaScriptSerializer Js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+
+    public static Dictionary<string, object> Py(IEnumerable<string> args)
+    {
+        var psi = new ProcessStartInfo("python", "-X utf8 scripts/sync_ai_config.py " + string.Join(" ", args.Select(a => "\"" + a + "\"")))
+        {
+            WorkingDirectory = Repo, UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8
+        };
+        psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+        using (var p = Process.Start(psi))
+        {
+            var err = p.StandardError.ReadToEndAsync();
+            var o = p.StandardOutput.ReadToEnd().Trim();
+            p.WaitForExit();
+            var line = o.Split('\n').LastOrDefault(l => l.TrimStart().StartsWith("{"));
+            if (line == null) throw new Exception("同步脚本没有返回结果：" + (err.Result + o).Trim());
+            return (Dictionary<string, object>)Js.DeserializeObject(line);
+        }
+    }
+
+    static IEnumerable<Dictionary<string, object>> Items(Dictionary<string, object> d, string k)
+    {
+        object v;
+        return d.TryGetValue(k, out v) && v is object[] ? ((object[])v).Cast<Dictionary<string, object>>() : Enumerable.Empty<Dictionary<string, object>>();
+    }
+    static IEnumerable<string> Strings(Dictionary<string, object> d, string k)
+    {
+        object v;
+        return d.TryGetValue(k, out v) && v is object[] ? ((object[])v).Cast<string>() : Enumerable.Empty<string>();
+    }
+    static string SkillOf(string path) { var p = path.Split('/'); return p.Length > 2 && p[0] == "skills" ? p[1] : null; }
+    static bool Noise(string path) { return path.Contains("/__pycache__/") || path.EndsWith(".pyc") || path.Contains(".bak") || path.Contains("/.trash"); }
+
+    static HashSet<string> Excluded(string client)
+    {
+        var r = new HashSet<string>();
+        var cfg = (Dictionary<string, object>)Js.DeserializeObject(File.ReadAllText(Path.Combine(Repo, @"sync\clients.json"), Encoding.UTF8));
+        object c;
+        if (client != "codex" && cfg.TryGetValue(client, out c))
+            foreach (var e in Strings((Dictionary<string, object>)c, "exclude")) { var s = e.StartsWith("skills/") ? e.Substring(7) : null; if (s != null) r.Add(s); }
+        return r;
+    }
+
+    // inspect 某端：遇到某个 Skill 报错就把它剔除后重试，其余照常检查
+    static void Inspect(string client, List<string> skills, Dictionary<string, SkillRow> rows)
+    {
+        var left = new List<string>(skills);
+        while (left.Count > 0)
+        {
+            var args = new List<string> { "inspect", "--client", client };
+            foreach (var s in left) { args.Add("--path"); args.Add("skills/" + s); }
+            var r = Py(args);
+            object err;
+            if (r.TryGetValue("error", out err))
+            {
+                var bad = left.FirstOrDefault(s => ((string)err).Contains("skills/" + s + "/") || ((string)err).EndsWith("skills/" + s));
+                if (bad == null) { foreach (var s in left) rows[s].Errors[client] = (string)err; return; }
+                rows[bad].Errors[client] = (string)err;
+                left.Remove(bad);
+                continue;
+            }
+            foreach (var ch in Items(r, "changes"))
+            {
+                var from = (string)ch["from"];
+                var s = SkillOf(from);
+                if (s == null || Noise(from) || !rows.ContainsKey(s)) continue;
+                if (!rows[s].Changes.ContainsKey(client)) rows[s].Changes[client] = new List<string>();
+                rows[s].Changes[client].Add(from);
+            }
+            return;
+        }
+    }
+
+    public static string DryRunError;
+
+    public static List<SkillRow> Scan()
+    {
+        var manifest = (Dictionary<string, object>)Js.DeserializeObject(File.ReadAllText(Path.Combine(Repo, @"sync\manifest.json"), Encoding.UTF8));
+        var managed = new HashSet<string>(Items(manifest, "entries").Select(e => SkillOf((string)e["path"])).Where(s => s != null));
+        var present = new Dictionary<string, HashSet<string>>();
+        var excluded = new Dictionary<string, HashSet<string>>();
+        foreach (var c in Clients)
+        {
+            var dir = Path.Combine(Homes[c], "skills");
+            present[c] = new HashSet<string>(Directory.Exists(dir) ? Directory.GetDirectories(dir).Select(Path.GetFileName).Where(n => !n.StartsWith(".")) : new string[0]);
+            excluded[c] = Excluded(c);
+        }
+        var rows = new Dictionary<string, SkillRow>();
+        foreach (var n in managed.Concat(present.Values.SelectMany(x => x)).Distinct().OrderBy(x => x))
+            rows[n] = new SkillRow { Name = n, Managed = managed.Contains(n) };
+
+        Dictionary<string, object> dry = null;
+        var threads = new List<Thread>();
+        threads.Add(new Thread(() => { try { dry = Py(new[] { "install", "--dry-run" }); } catch (Exception e) { DryRunError = e.Message; } }));
+        foreach (var c0 in Clients)
+        {
+            var c = c0;
+            var list = rows.Values.Where(r => r.Managed && present[c].Contains(r.Name) && !excluded[c].Contains(r.Name)).Select(r => r.Name).ToList();
+            threads.Add(new Thread(() => { try { Inspect(c, list, rows); } catch (Exception e) { foreach (var s in list) rows[s].Errors[c] = e.Message; } }));
+        }
+        DryRunError = null;
+        foreach (var t in threads) t.Start();
+        foreach (var t in threads) t.Join();
+
+        var pending = Clients.ToDictionary(c => c, c => new HashSet<string>());
+        if (dry != null)
+        {
+            object e;
+            if (dry.TryGetValue("error", out e)) DryRunError = (string)e;
+            object cl;
+            if (dry.TryGetValue("clients", out cl))
+                foreach (var kv in (Dictionary<string, object>)cl)
+                    foreach (var p in Strings((Dictionary<string, object>)kv.Value, "copied").Concat(Strings((Dictionary<string, object>)kv.Value, "deleted")))
+                    { var s = SkillOf(p); if (s != null && pending.ContainsKey(kv.Key)) pending[kv.Key].Add(s); }
+            object na;
+            if (dry.TryGetValue("needs_adaptation", out na))
+                foreach (var kv in (Dictionary<string, object>)na)
+                    foreach (var h in ((object[])kv.Value).Cast<Dictionary<string, object>>())
+                    {
+                        var s = SkillOf((string)h["path"]);
+                        if (s != null && rows.ContainsKey(s))
+                            rows[s].Adapt.Add(kv.Key + "  " + h["path"] + ":" + h["line"] + "  " + string.Join(", ", ((object[])h["terms"]).Cast<string>()));
+                    }
+        }
+
+        foreach (var r in rows.Values)
+            foreach (var c in Clients)
+            {
+                string st;
+                if (excluded[c].Contains(r.Name)) st = "excluded";
+                else if (!r.Managed) st = present[c].Contains(r.Name) ? "local" : "absent";
+                else if (r.Errors.ContainsKey(c)) st = "error";
+                else if (r.Changes.ContainsKey(c)) st = "changed";
+                else if (pending[c].Contains(r.Name) || !present[c].Contains(r.Name)) st = "pending";
+                else st = "ok";
+                r.State[c] = st;
+            }
+        return rows.Values.ToList();
+    }
+
+    // 从某端导入改动：导入唯一源码、生成快照、更新三端、提交并推送
+    public static string Publish(string client, IEnumerable<string> paths, string skill)
+    {
+        var args = new List<string> { "publish", "--client", client, "--push", "--message", "sync(" + skill + "): 从 " + client + " 导入改动" };
+        foreach (var p in paths) { args.Add("--path"); args.Add(p); }
+        var r = Py(args);
+        object e;
+        if (r.TryGetValue("error", out e)) throw new Exception((string)e);
+        object c;
+        return r.TryGetValue("commit", out c) ? "已提交 " + ((string)c).Substring(0, 7) + " 并推送" : "无需提交";
+    }
+
+    // 纳入一个仅存在于某端的新 Skill：先 inspect 出具体文件（去掉缓存/备份），再发布
+    public static string Adopt(string client, string skill)
+    {
+        var r = Py(new[] { "inspect", "--client", client, "--path", "skills/" + skill });
+        object e;
+        if (r.TryGetValue("error", out e)) throw new Exception((string)e);
+        var files = Items(r, "changes").Select(ch => (string)ch["from"]).Where(p => !Noise(p)).ToList();
+        if (files.Count == 0) throw new Exception("没有可导入的文件");
+        return Publish(client, files, skill);
+    }
+
+    public static string Install()
+    {
+        var r = Py(new[] { "install" });
+        object e;
+        if (r.TryGetValue("error", out e)) throw new Exception((string)e);
+        var cl = (Dictionary<string, object>)r["clients"];
+        return string.Join("，", cl.Select(kv => kv.Key + " " + Strings((Dictionary<string, object>)kv.Value, "copied").Count() + " 个文件"));
+    }
+}
+
 static class Ui
 {
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int a, ref int v, int s);
@@ -583,6 +775,11 @@ class MainWin
         F<Button>("BtnSync").Click += (s, e) => Run("正在同步会话…", () => Log("手动同步完成，更新 " + Core.Sync() + " 个文件"));
         F<Button>("BtnFolder").Click += (s, e) => Process.Start("explorer.exe", "\"" + Core.Sessions + "\"");
         F<Button>("BtnAdd").Click += (s, e) => AddAccount();
+        F<Button>("TabAccounts").Click += (s, e) => ShowPage(false);
+        F<Button>("TabSkills").Click += (s, e) => ShowPage(true);
+        F<Button>("BtnScan").Click += (s, e) => ScanSkills();
+        F<Button>("BtnInstall").Click += (s, e) => Run("正在同步到三端…", () => { Log("同步到三端：" + SkillSync.Install()); skillRows = SkillSync.Scan(); skillAt = DateTime.Now; }, "已同步到三端");
+        ShowPage(false);
 
         debounce = new Timer(_ =>
         {
@@ -603,6 +800,143 @@ class MainWin
         usageTimer.Tick += (s, e) => { if (busy.Visibility != Visibility.Visible) Refresh(); };
         usageTimer.Start();
         if (!hidden) w.Show();
+    }
+
+    List<SkillRow> skillRows;
+    DateTime skillAt;
+    static readonly Dictionary<string, string> ClientName = new Dictionary<string, string> { { "codex", "Codex" }, { "claude", "Claude" }, { "pi", "Pi" } };
+
+    void ShowPage(bool skills)
+    {
+        F<Grid>("PageAccounts").Visibility = skills ? Visibility.Collapsed : Visibility.Visible;
+        F<Grid>("PageSkills").Visibility = skills ? Visibility.Visible : Visibility.Collapsed;
+        var on = F<Button>(skills ? "TabSkills" : "TabAccounts");
+        var off = F<Button>(skills ? "TabAccounts" : "TabSkills");
+        on.Background = Brushes.White; on.Foreground = Ui.B("#1F1E1D");
+        off.ClearValue(Control.BackgroundProperty); off.ClearValue(Control.ForegroundProperty);
+        if (skills && skillRows == null) ScanSkills();
+    }
+
+    void ScanSkills()
+    {
+        Run("正在预检三端 Skill…（约 10 秒）", () => { skillRows = SkillSync.Scan(); skillAt = DateTime.Now; }, null);
+    }
+
+    static string Overall(SkillRow r)
+    {
+        if (r.Errors.Count > 0) return "error";
+        if (r.Changes.Count > 0) return "changed";
+        if (r.Adapt.Count > 0) return "adapt";
+        if (r.State.Values.Contains("pending")) return "pending";
+        if (!r.Managed) return "local";
+        return "ok";
+    }
+
+    static readonly Dictionary<string, string[]> StatusLook = new Dictionary<string, string[]> {
+        { "ok", new[] { "一致", "#3FA27A", "#E7F4EE" } }, { "changed", new[] { "有改动", "#C2593A", "#FBEDE7" } },
+        { "adapt", new[] { "需适配", "#B7791F", "#FBF1DE" } }, { "pending", new[] { "待安装", "#3B6FD8", "#E6EEFC" } },
+        { "local", new[] { "未纳入同步", "#7E57C2", "#F0EAF9" } }, { "error", new[] { "无法检查", "#C2412D", "#F9E3DF" } } };
+    static readonly Dictionary<string, string[]> CellLook = new Dictionary<string, string[]> {
+        { "ok", new[] { "✓", "#3FA27A" } }, { "changed", new[] { "改动", "#C2593A" } }, { "pending", new[] { "待安装", "#3B6FD8" } },
+        { "local", new[] { "仅此端", "#7E57C2" } }, { "excluded", new[] { "不同步", "#A8A7A2" } }, { "absent", new[] { "—", "#C9C7C1" } },
+        { "error", new[] { "出错", "#C2412D" } } };
+
+    static Grid SkillGrid()
+    {
+        var g = new Grid();
+        g.ColumnDefinitions.Add(new ColumnDefinition());
+        foreach (var wdt in new[] { 80, 80, 80, 110, 230 }) g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(wdt) });
+        return g;
+    }
+
+    static void Put(Grid g, UIElement e, int col) { Grid.SetColumn(e, col); g.Children.Add(e); }
+
+    void RenderSkills()
+    {
+        if (skillRows == null) return;
+        F<TextBlock>("TxtSkillSub").Text = "Codex · Claude · Pi 三端  ·  上次预检 " + skillAt.ToString("HH:mm:ss") +
+            (SkillSync.DryRunError != null ? "  ·  预检出错：" + SkillSync.DryRunError : "");
+        var chips = F<WrapPanel>("SkillChips");
+        chips.Children.Clear();
+        foreach (var k in new[] { "ok", "changed", "adapt", "pending", "local", "error" })
+        {
+            var n = skillRows.Count(r => Overall(r) == k);
+            if (n == 0) continue;
+            var l = StatusLook[k];
+            chips.Children.Add(new Border { Background = Ui.B(l[2]), CornerRadius = new CornerRadius(8), Padding = new Thickness(10, 4, 10, 4), Margin = new Thickness(0, 0, 8, 0),
+                Child = new TextBlock { Text = l[0] + "  " + n, Foreground = Ui.B(l[1]), FontSize = 12, FontWeight = FontWeights.SemiBold } });
+        }
+        F<Button>("BtnInstall").IsEnabled = skillRows.Any(r => r.State.Values.Contains("pending"));
+
+        var head = F<Grid>("SkillHeader");
+        head.Children.Clear(); head.ColumnDefinitions.Clear();
+        foreach (var cd in SkillGrid().ColumnDefinitions.ToList()) { var c = new ColumnDefinition { Width = cd.Width }; head.ColumnDefinitions.Add(c); }
+        var titles = new[] { "Skill", "Codex", "Claude", "Pi", "状态", "操作" };
+        for (int i = 0; i < titles.Length; i++) Put(head, new TextBlock { Text = titles[i], Foreground = Ui.B("#8A8984"), FontSize = 12 }, i);
+
+        var list = F<StackPanel>("SkillList");
+        list.Children.Clear();
+        var rank = new[] { "error", "changed", "adapt", "pending", "ok", "local" };
+        foreach (var r in skillRows.OrderBy(x => Array.IndexOf(rank, Overall(x))).ThenBy(x => x.Name))
+        {
+            var g = SkillGrid();
+            g.Margin = new Thickness(18, 10, 18, 10);
+            Put(g, new TextBlock { Text = r.Name, FontSize = 13, FontWeight = FontWeights.SemiBold, VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis }, 0);
+            for (int i = 0; i < SkillSync.Clients.Length; i++)
+            {
+                var c = SkillSync.Clients[i];
+                var look = CellLook[r.State[c]];
+                var t = new TextBlock { Text = look[0], Foreground = Ui.B(look[1]), FontSize = 12, VerticalAlignment = VerticalAlignment.Center };
+                if (r.Errors.ContainsKey(c)) t.ToolTip = r.Errors[c];
+                if (r.Changes.ContainsKey(c)) t.ToolTip = string.Join("\n", r.Changes[c]);
+                Put(g, t, i + 1);
+            }
+            var st = StatusLook[Overall(r)];
+            Put(g, new Border { Background = Ui.B(st[2]), CornerRadius = new CornerRadius(6), Padding = new Thickness(8, 2, 8, 3), HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Center,
+                Child = new TextBlock { Text = st[0], Foreground = Ui.B(st[1]), FontSize = 12 } }, 4);
+
+            var acts = new WrapPanel { VerticalAlignment = VerticalAlignment.Center };
+            var row = r;
+            foreach (var kv in r.Changes)
+            {
+                var c = kv.Key; var files = kv.Value;
+                acts.Children.Add(SmallBtn("导入 " + ClientName[c], () => ImportSkill(row.Name, c, files)));
+            }
+            if (!r.Managed)
+            {
+                var c = SkillSync.Clients.FirstOrDefault(x => r.State[x] == "local");
+                if (c != null) acts.Children.Add(SmallBtn("纳入同步", () => AdoptSkill(row.Name, c)));
+            }
+            if (r.Adapt.Count > 0)
+                acts.Children.Add(SmallBtn("查看适配", () => Ui.Ask(w, "「" + row.Name + "」需要适配", string.Join("\n", row.Adapt) +
+                    "\n\n处理方法：在 ai-config 的 sync/clients.json 里给这个写法加术语（terms）或替换规则；如果本来就该保留原文，把文件加入 leftovers_allow。", false, null, "知道了", false)));
+            if (r.Errors.Count > 0)
+                acts.Children.Add(SmallBtn("查看原因", () => Ui.Ask(w, "「" + row.Name + "」无法检查", string.Join("\n", row.Errors.Select(x => ClientName[x.Key] + "：" + x.Value)), false, null, "知道了", false)));
+            Put(g, acts, 5);
+
+            list.Children.Add(new Border { BorderBrush = Ui.B("#F1EFEA"), BorderThickness = new Thickness(0, 0, 0, 1), Child = g });
+        }
+    }
+
+    Button SmallBtn(string text, Action a)
+    {
+        var b = new Button { Content = text, Style = Ui.S("Small"), Margin = new Thickness(0, 2, 6, 2) };
+        b.Click += (s, e) => a();
+        return b;
+    }
+
+    void ImportSkill(string skill, string client, List<string> files)
+    {
+        var msg = "把 " + ClientName[client] + " 端「" + skill + "」的 " + files.Count + " 个改动文件导入共享源码，生成三端快照并安装到三端，然后提交推送到 ai-config。\n\n" +
+            string.Join("\n", files.Take(8)) + (files.Count > 8 ? "\n……" : "");
+        if (Ui.Ask(w, "导入改动", msg, false, null, "导入并同步", false) == null) return;
+        Run("正在导入「" + skill + "」并同步三端…", () => { Log("「" + skill + "」" + SkillSync.Publish(client, files, skill)); skillRows = SkillSync.Scan(); skillAt = DateTime.Now; }, "「" + skill + "」已同步到三端");
+    }
+
+    void AdoptSkill(string skill, string client)
+    {
+        if (Ui.Ask(w, "纳入同步", "「" + skill + "」目前只在 " + ClientName[client] + " 端。纳入后会导入共享源码，安装到其他客户端，并提交推送到 ai-config。\n\n如果它只适用于 " + ClientName[client] + "，请改为在 sync/clients.json 中排除，不要纳入。", false, null, "纳入并同步", false) == null) return;
+        Run("正在纳入「" + skill + "」…", () => { Log("「" + skill + "」" + SkillSync.Adopt(client, skill)); skillRows = SkillSync.Scan(); skillAt = DateTime.Now; }, "「" + skill + "」已纳入同步");
     }
 
     void ShowWin()
@@ -691,6 +1025,7 @@ class MainWin
         foreach (var p in profs) list.Children.Add(Card(p, p.Name == cur, i++));
         RefreshStats();
         BuildTrayMenu(profs, cur);
+        RenderSkills();
     }
 
     UIElement Card(Prof p, bool isCur, int idx)

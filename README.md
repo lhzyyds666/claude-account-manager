@@ -15,6 +15,7 @@ Claude 桌面端的 Windows 小工具：一键切换多个账号，多个账号�
   - 5 小时窗口从窗口内第一条消息开始计时，时间取自 `~/.claude/projects` 里的对话记录。
   - 每周重置为每个账号单独设定的固定星期和时间，点击即可修改。
   - 可选的状态栏模式：读取 Claude Code 传给状态栏的官方 `rate_limits` 字段，得到精确值。
+- **Skill 同步**：在「Skill 同步」页调用 [ai-config](https://github.com/lhzyyds666/ai-config) 的 `sync_ai_config.py`，列出 Codex、Claude、Pi 三端每个 Skill 的状态：一致、有改动、待安装、仅此端、不同步、需适配。可以一键导入某端的改动并同步到三端、把只在一端的 Skill 纳入同步，也能查看需要适配的位置。仓库默认位置是 `~/.codex`。
 - **托盘**：双击打开主界面，右键可以快速切换账号、立即同步。支持开机自启和关闭时最小化到托盘。
 
 ## 编译
